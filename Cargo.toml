@@ -1,0 +1,10 @@
+[package]
+name = "udprelay-rust"
+version = "0.1.0"
+edition = "2021"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[dependencies]
+clap = { version = "4.5.8", features = ["derive"] }
