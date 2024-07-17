@@ -1,17 +1,16 @@
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::process::{exit, ExitCode};
 use std::rc::{Rc, Weak};
 use std::str;
 use std::time::Duration;
 use std::time::SystemTime;
-use std::collections::{HashMap, HashSet};
-use std::process::{exit, ExitCode};
 
-use daemonize_me::Daemon;
 use clap::Parser;
-
+use daemonize_me::Daemon;
 
 enum Ops {
     // SYN,
@@ -40,17 +39,9 @@ struct Args {
     #[clap(default_value = "0.0.0.0")]
     bind_ip: Ipv4Addr,
 
-    /// Reject unknown sender (only has effect before COUNT)
-    #[arg(short, long)]
-    no_reject_unknown_sender: bool,
-
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
-
-    /// Number of times to allow adjusting peer address after PSK verification
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
 
     /// Daemonize the process
     #[arg(short, long)]
@@ -81,36 +72,10 @@ struct Args {
 macro_rules! println_if_verbose {
     ($verbose:expr, $($arg:tt)*) => {
         if $verbose {
-            println!($($arg)*);
+            eprintln!($($arg)*);
         }
     };
 }
-
-// #[derive(Debug)]
-// struct TimeoutError {
-//     message: String,
-//     addr: Option<SocketAddr>,
-// }
-
-// impl TimeoutError {
-//     fn to_message(&self) -> String {
-//         format!(
-//             "{}: {}",
-//             self.message,
-//             self.addr
-//                 .map_or("[..]".to_owned(), |addr| { addr.to_string() })
-//         )
-//     }
-// }
-
-// impl From<io::Error> for TimeoutError {
-//     fn from(error: io::Error) -> Self {
-//         TimeoutError {
-//             // kind: String::from("parse"),
-//             message: error.to_string(),
-//         }
-//     }
-// }
 
 #[derive(Debug)]
 struct ExpiringTimer(SystemTime);
@@ -410,7 +375,7 @@ fn start_relay_service(args: &Args, socket: UdpSocket) {
 
             // when this socket timeout, do some processing in the following.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-            Err(e) => println!("Unexpected error: {e}"),
+            Err(e) => eprintln!("Unexpected error: {e}"),
             _ => (),
         };
 
@@ -436,13 +401,10 @@ fn start_relay_service(args: &Args, socket: UdpSocket) {
         registry.remove_expired_pairing_request(&args);
         registry.remove_inactive_connections(&args);
     }
-    println!("end");
 }
 
-
-
-fn post_fork_parent(ppid: i32, cpid: i32) -> ! {
-    println!("Daeminized process started; pid: {}.", cpid);
+fn post_fork_parent(_ppid: i32, cpid: i32) -> ! {
+    eprintln!("Daeminized process started; pid: {}.", cpid);
     exit(0)
 }
 
@@ -453,7 +415,7 @@ fn main() -> ExitCode {
     let socket = match bind_socket(args.bind_ip, args.udp_port, &args) {
         Ok(socket) => socket,
         Err(e) => {
-            println!("Cannot binds socket: {}", e);
+            eprintln!("Cannot binds socket: {}", e);
             exit(49)
         }
     };
@@ -472,7 +434,7 @@ fn main() -> ExitCode {
             .setup_post_fork_parent_hook(post_fork_parent);
 
         match daemon.start() {
-            Ok(_) => println!("Success, daemonized"),
+            Ok(_) => eprintln!("Success, daemonized"),
             Err(e) => {
                 eprintln!("Error: {}", e);
                 return ExitCode::from(128);
