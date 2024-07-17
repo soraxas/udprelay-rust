@@ -52,25 +52,25 @@ struct Args {
     #[arg(short, long, default_value_t = 1)]
     count: u8,
 
-    /// Number of seconds before timing out the socket wait. This defines how often would
-    /// the relay check for inactivities, and hence, terminates the connection.
-    #[arg(short, long, default_value_t = 5)]
-    timeout: u64,
-
     /// Daemonize the process
     #[arg(short, long)]
     daemonize: bool,
 
+    /// Number of seconds before timing out the socket wait. This defines how often would
+    /// the relay check for inactivities, and hence, terminates the connection.
+    #[arg(short, long, default_value_t = 25)]
+    timeout_socket_wait: u64,
+
     /// Number of seconds before timing out with no connections
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 300)]
     timeout_no_connections: u64,
 
     /// Number of seconds before timing out the peer pairing
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 90)]
     timeout_pairing: u64,
 
     /// Number of seconds before timing out connection with no activities
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 180)]
     timeout_connection_inactivities: u64,
 
     /// Pre-shared key
@@ -215,7 +215,7 @@ fn build_paired_peers<'a>(
 fn bind_socket(ip: Ipv4Addr, port: u16, args: &Args) -> Result<UdpSocket, io::Error> {
     UdpSocket::bind((ip, port)).and_then(|socket| {
         socket
-            .set_read_timeout(Some(Duration::new(args.timeout, 0)))
+            .set_read_timeout(Some(Duration::new(args.timeout_socket_wait, 0)))
             .ok();
         Ok(socket)
     })
