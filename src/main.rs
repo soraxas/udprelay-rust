@@ -1,23 +1,40 @@
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::exit;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::rc::{Rc, Weak};
 use std::str;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
-use std::{error::Error, fmt};
+use std::time::SystemTime;
+use std::collections::{HashMap, HashSet};
+use std::process::{exit, ExitCode};
 
+use daemonize_me::Daemon;
 use clap::Parser;
+
+
+enum Ops {
+    // SYN,
+    ACK,
+    EstablishConnection,
+}
+
+impl Ops {
+    fn value(&self) -> [u8; 2] {
+        match *self {
+            // Ops::SYN => [0xff, 0x02],
+            Ops::ACK => [0xff, 0x12],
+            Ops::EstablishConnection => [0xff, 0x05],
+        }
+    }
+}
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// UDP Port for peer A
-    port_a: u16,
-
-    /// UDP Port for peer B
-    port_b: u16,
+    /// UDP Port for peer connection
+    udp_port: u16,
 
     /// The ip to binds
     #[clap(default_value = "0.0.0.0")]
@@ -35,12 +52,29 @@ struct Args {
     #[arg(short, long, default_value_t = 1)]
     count: u8,
 
-    /// Number of seconds before timing out the socket wait
+    /// Number of seconds before timing out the socket wait. This defines how often would
+    /// the relay check for inactivities, and hence, terminates the connection.
     #[arg(short, long, default_value_t = 5)]
     timeout: u64,
 
+    /// Daemonize the process
+    #[arg(short, long)]
+    daemonize: bool,
+
+    /// Number of seconds before timing out with no connections
+    #[arg(long, default_value_t = 5)]
+    timeout_no_connections: u64,
+
+    /// Number of seconds before timing out the peer pairing
+    #[arg(long, default_value_t = 3)]
+    timeout_pairing: u64,
+
+    /// Number of seconds before timing out connection with no activities
+    #[arg(long, default_value_t = 6)]
+    timeout_connection_inactivities: u64,
+
     /// Pre-shared key
-    #[arg(short, long, default_value = "HA12")]
+    #[arg(long, default_value = "uNYDA5QRcvYgp2gfS5v5")]
     preshared_key: String,
 }
 
@@ -52,22 +86,22 @@ macro_rules! println_if_verbose {
     };
 }
 
-#[derive(Debug)]
-struct TimeoutError {
-    message: String,
-    addr: Option<SocketAddr>,
-}
+// #[derive(Debug)]
+// struct TimeoutError {
+//     message: String,
+//     addr: Option<SocketAddr>,
+// }
 
-impl TimeoutError {
-    fn to_message(&self) -> String {
-        format!(
-            "{}: {}",
-            self.message,
-            self.addr
-                .map_or("[..]".to_owned(), |addr| { addr.to_string() })
-        )
-    }
-}
+// impl TimeoutError {
+//     fn to_message(&self) -> String {
+//         format!(
+//             "{}: {}",
+//             self.message,
+//             self.addr
+//                 .map_or("[..]".to_owned(), |addr| { addr.to_string() })
+//         )
+//     }
+// }
 
 // impl From<io::Error> for TimeoutError {
 //     fn from(error: io::Error) -> Self {
@@ -78,114 +112,104 @@ impl TimeoutError {
 //     }
 // }
 
-fn loop_process_socket<T>(
-    socket: &UdpSocket,
-    mut on_message_functor: impl FnMut(&[u8], SocketAddr) -> Option<T>,
-) -> Result<T, TimeoutError> {
-    // loop untils some value is returned by the functor
-    let mut buf = [0u8; 65535];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) if n > 0 => match on_message_functor(&buf[..n], from) {
-                Some(v) => return Ok(v),
-                None => {}
-            },
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(TimeoutError {
-                    message: format!("Timeout reached",),
-                    addr: socket.local_addr().ok(),
-                });
+#[derive(Debug)]
+struct ExpiringTimer(SystemTime);
+
+impl ExpiringTimer {
+    fn access(&mut self) {
+        self.0 = SystemTime::now();
+    }
+
+    fn is_expired(&self, timeout: u64) -> bool {
+        let elapsed = match SystemTime::now().duration_since(self.0) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "Error in getting time elapsed: {}. Defaulting to timeout.",
+                    e
+                );
+                Duration::new(timeout, 0)
             }
-            _ => {}
         };
+        elapsed.as_secs() >= timeout
+    }
+
+    fn new() -> ExpiringTimer {
+        return ExpiringTimer(SystemTime::now());
     }
 }
 
-fn wait_for_peers_check_psk(fsrc: &UdpSocket, args: &Args) -> Result<SocketAddr, TimeoutError> {
-    // function that verifies PSK
-    let udp = fsrc.local_addr().unwrap().port();
-    println_if_verbose!(args.verbose, "> Waiting for PSK @UDP {}", udp);
-
-    loop_process_socket(&fsrc, |message, from| {
-        let Ok(v) = str::from_utf8(&message) else {
-            return None;
-        };
-        if v.trim() == args.preshared_key {
-            println_if_verbose!(args.verbose, "> Got peer info for {from}");
-            return Some(from);
-        }
-        println_if_verbose!(args.verbose, ">> Invalid key @UDP {udp}, from {from}");
-        None
-    })
-}
-
-struct Peer<'a> {
+#[derive(Debug)]
+struct Recipient<'a> {
     socket: &'a UdpSocket,
-    addr: Mutex<SocketAddr>,
+    addr: SocketAddr,
 }
-// struct Peer<'a> {
-//     socket: &'a UdpSocket,
-//     addr: Arc<Mutex<SocketAddr>>,
-// }
 
-// Worker function to handle UDP packet forwarding
-// fn relay_worker(
-//     src: &Peer,
-//     dst: &Peer,
-
-//     args: &Args,
-// ) -> Result<(), TimeoutError> {
-//     let a = relay_worker__(fsrc, fdst, ssrc, sdst, args);
-//     println!("exiting... {:?}", fsrc);
-//     a
-// }
-fn relay_worker(src: &Peer, dst: &Peer, args: &Args) -> Result<(), TimeoutError> {
-    // helper function to print output
-    let _verbose_print_recieved_data = |message: &[u8], from: SocketAddr| {
-        if !args.verbose {
-            return;
-        }
-        let message = str::from_utf8(&message)
-            .and_then(|m| Ok(m.to_owned()))
-            .unwrap_or(format!("[some bytes of length {}]", message.len()));
-        println!(
-            "> {} => {}: {} | => {}",
-            from,
-            src.addr.lock().unwrap(),
-            message.trim(),
-            dst.addr.lock().unwrap()
-        );
-    };
-
-    for _ in 0..args.count {
-        loop_process_socket(&src.socket, |message, from| {
-            // update the peer source address as the actual current from's port
-            *src.addr.lock().unwrap() = from;
-
-            _verbose_print_recieved_data(message, from);
-
-            dst.socket
-                .send_to(&message, *dst.addr.lock().unwrap())
-                .unwrap();
-            Some(()) // break every time
-        })?
+impl Recipient<'_> {
+    fn send_message(&self, message: &[u8]) {
+        self.socket
+            .send_to(&message, self.addr)
+            .expect("Error in sending message");
     }
-    println_if_verbose!(args.verbose, ">> Locking adress");
+}
 
-    // we will now fix the address
-    let fixed_src_addr: SocketAddr = src.addr.lock().unwrap().clone();
-    let fixed_dst_addr: SocketAddr = dst.addr.lock().unwrap().clone();
+#[derive(Debug)]
+struct RecipientData<'a> {
+    recipient: Recipient<'a>,
+    last_accessed: ExpiringTimer,
+    opponent: Option<Weak<RefCell<RecipientData<'a>>>>,
+}
 
-    loop_process_socket(&src.socket, |message, from| {
-        if !args.no_reject_unknown_sender && fixed_src_addr != from {
-            println_if_verbose!(args.verbose, "> Rejected unknown peer {}", from);
-            return None;
-        }
+impl<'a> RecipientData<'a> {
+    fn get_opponent(&mut self) -> Rc<RefCell<RecipientData<'a>>> {
+        self.opponent
+            .as_mut()
+            .expect("Option is empty. Bugs in setting up opponent?")
+            .upgrade()
+            .expect("Cannot upgrade to strong reference")
+    }
+}
 
-        _verbose_print_recieved_data(message, from);
-        dst.socket.send_to(&message, fixed_dst_addr).unwrap();
-        None
-    })
+fn build_paired_peers<'a>(
+    addr_1: &SocketAddr,
+    udp_1: &'a UdpSocket,
+    addr_2: &SocketAddr,
+    udp_2: &'a UdpSocket,
+) -> (
+    Rc<RefCell<RecipientData<'a>>>,
+    Rc<RefCell<RecipientData<'a>>>,
+) {
+    let peer1 = Rc::new(RefCell::new(RecipientData {
+        recipient: Recipient {
+            socket: &udp_1,
+            addr: addr_1.clone(),
+        },
+        last_accessed: ExpiringTimer::new(),
+        opponent: None,
+    }));
+    let peer2 = Rc::new(RefCell::new(RecipientData {
+        recipient: Recipient {
+            socket: &udp_2,
+            addr: addr_2.clone(),
+        },
+        last_accessed: ExpiringTimer::new(),
+        opponent: None,
+    }));
+    // assign the opposing reference as weak pointer
+
+    // peer1.borrow_mut().get_mut().op;
+
+    peer1
+        .as_ref()
+        .borrow_mut()
+        .opponent
+        .replace(Rc::downgrade(&peer2));
+    peer2
+        .as_ref()
+        .borrow_mut()
+        .opponent
+        .replace(Rc::downgrade(&peer1));
+    (peer1, peer2)
 }
 
 fn bind_socket(ip: Ipv4Addr, port: u16, args: &Args) -> Result<UdpSocket, io::Error> {
@@ -197,111 +221,265 @@ fn bind_socket(ip: Ipv4Addr, port: u16, args: &Args) -> Result<UdpSocket, io::Er
     })
 }
 
-fn main() {
-    let args = Args::parse();
+fn concat_arrays<T: Copy>(known_array: &[T], borrowed_slice: &[T]) -> Vec<T> {
+    let mut combined_array = Vec::with_capacity(known_array.len() + borrowed_slice.len());
 
-    // Create UDP sockets for port A and port B
-    let udp_a = bind_socket(args.bind_ip, args.port_a, &args).expect("cannot binds socket");
-    let udp_b = bind_socket(args.bind_ip, args.port_b, &args).expect("cannot binds socket");
+    combined_array.extend_from_slice(known_array);
+    combined_array.extend_from_slice(borrowed_slice);
 
-    // // verify pre-shared key
-    // let peers = thread::scope(|scope| {
-    //     let peer_a = scope.spawn(|| wait_for_peers_check_psk(&udp_a, &args));
-    //     let peer_b = scope.spawn(|| wait_for_peers_check_psk(&udp_b, &args));
+    combined_array
+}
 
-    //     // let peer_a = peer_a.join().unwrap().ok().unwrap();
-    //     let peer_a = match peer_a.join().unwrap() {
-    //         Ok(v) => v,
-    //         Err(e) => {
-    //             print!("{:?}", e);
-    //             panic!("i------------");
-    //         }
-    //     };
-
-    //     let peer_b = peer_b.join().unwrap().ok().unwrap();
-    //     return (peer_a, peer_b);
-    // });
-
-    let peers = (
-        SocketAddr::new(IpAddr::V4(args.bind_ip), args.port_a),
-        SocketAddr::new(IpAddr::V4(args.bind_ip), args.port_b),
+fn process_relay_service(args: &Args, buffer: &[u8], sender: &Rc<RefCell<RecipientData>>) {
+    let mut sender = sender.as_ref().borrow_mut();
+    sender.last_accessed.access();
+    let receiver = sender.get_opponent();
+    let receiver = receiver.as_ref().borrow_mut();
+    receiver.recipient.send_message(&buffer);
+    println_if_verbose!(
+        args.verbose,
+        "> Relaying message {} => {} => {}: ",
+        sender.recipient.addr,
+        str::from_utf8(&buffer).unwrap_or("[some bytes]").trim(),
+        receiver.recipient.addr
     );
+}
 
-    // // Socket addresses for binding
-    // let sock_a: SocketAddr = SocketAddr::new(IpAddr::V4(args.bind_ip), args.port_a);
-    // let sock_b: SocketAddr = SocketAddr::new(IpAddr::V4(args.bind_ip), args.port_b);
+fn process_pairing_request(
+    args: &Args,
+    registry: &mut RelayService,
+    buffer: &[u8],
+    from: &SocketAddr,
+) {
+    let psk_bytes = args.preshared_key.as_bytes();
+    // [**xyPPPPP...PPPPPSSSSS....SSSS]
+    // *: command
+    // x: denote number of bytes (after the first 4 bytes) for PSK
+    // y: denote number of bytes (after the first 4 + x bytes) for secret key
+    // P: pre-shared key (where len = x)
+    // S: Secret key (where len = y)
+    if buffer.len() > (2 + args.preshared_key.as_bytes().len()) {
+        // check at least it has the minimum number of bytes needed
+        if buffer[0..2] == Ops::EstablishConnection.value() {
+            println_if_verbose!(args.verbose, "> Got establish connection token from {from}");
 
-    // //////////////////
-    println_if_verbose!(args.verbose, "> Starting bidirectional relay...");
-
-    // Create threads for bidirectional UDP relay
-    thread::scope(|scope| {
-        let join_thread_handle = |handle: thread::ScopedJoinHandle<Result<(), TimeoutError>>| {
-            if let Err(e) = handle.join().unwrap() {
-                println_if_verbose!(args.verbose, "{}: ", e.to_message());
+            let n_psk: usize = buffer[2].into();
+            let psk_end = 4 + n_psk;
+            let n_secret: usize = buffer[3].into();
+            if buffer.len() < n_psk + n_secret {
+                println_if_verbose!(
+                    args.verbose,
+                    "> Aborting as there aren't enough message length than needed"
+                );
+                return;
             }
+
+            let peer_secret = &buffer[psk_end..(psk_end + n_secret)];
+
+            if &buffer[4..psk_end] == psk_bytes {
+                // send ack
+                println_if_verbose!(
+                    args.verbose,
+                    "> Authenticated. Peer secret: {:?}",
+                    str::from_utf8(peer_secret).unwrap_or("[some bytes]")
+                );
+                match registry.pending_pairing.get_mut(peer_secret) {
+                    Some((other_peer, timer)) if other_peer == from => {
+                        println_if_verbose!(
+                            args.verbose,
+                            "> Found existing pairing request from same address/ip/secret. Ignoring..."
+                        );
+                        timer.access();
+                    }
+                    Some((_, _)) => {
+                        let (other_peer, _) = registry
+                            .pending_pairing
+                            .remove(peer_secret)
+                            .expect("This should exists, as it just were");
+                        let (peer1, peer2) = build_paired_peers(
+                            &other_peer,
+                            &registry.socket,
+                            from,
+                            &registry.socket,
+                        );
+                        println_if_verbose!(
+                            args.verbose,
+                            "> Found other peer with same secret. Connecting {} to {}.",
+                            peer1.borrow().recipient.addr,
+                            peer2.borrow().recipient.addr,
+                        );
+                        registry.pairing.insert(other_peer, peer1);
+                        registry.pairing.insert(from.clone(), peer2);
+                    }
+                    None => {
+                        let message = concat_arrays(&Ops::ACK.value(), peer_secret);
+                        registry
+                            .socket
+                            .send_to(&message, from)
+                            .expect("Error in sending message");
+
+                        registry
+                            .pending_pairing
+                            .borrow_mut()
+                            .insert(peer_secret.to_owned(), (from.clone(), ExpiringTimer::new()));
+                    }
+                }
+            } else {
+                println_if_verbose!(args.verbose, "> Aborting as psk does not match");
+            }
+        }
+    }
+}
+
+struct RelayService<'a> {
+    pairing: HashMap<SocketAddr, Rc<RefCell<RecipientData<'a>>>>,
+    pending_pairing: HashMap<Vec<u8>, (SocketAddr, ExpiringTimer)>,
+    socket: &'a UdpSocket,
+}
+
+impl RelayService<'_> {
+    fn is_empty(&self) -> bool {
+        self.pairing.len() == 0 && self.pending_pairing.len() == 0
+    }
+
+    fn remove_inactive_connections(&mut self, args: &Args) {
+        if self.pairing.len() == 0 {
+            return;
+        }
+        // keep track of the pairs of addr to remove.
+        let mut to_remove = HashSet::new();
+        for (_, peer_a_rc) in &self.pairing {
+            let mut peer_a_guard = peer_a_rc.as_ref().borrow_mut();
+            let peer_b_rc = peer_a_guard.get_opponent();
+            let peer_b_guard = peer_b_rc.as_ref().borrow_mut();
+
+            let last_access_a = &peer_a_guard.last_accessed;
+            let last_access_b = &peer_b_guard.last_accessed;
+
+            if last_access_a.is_expired(args.timeout_connection_inactivities)
+                && last_access_b.is_expired(args.timeout_connection_inactivities)
+            {
+                println_if_verbose!(args.verbose, "> Connection between '{addr1}' and '{addr2} has no activities after {timeout} seconds. Removing them...",
+                        addr1=peer_a_guard.recipient.addr,
+                        addr2=peer_b_guard.recipient.addr,
+                        timeout=args.timeout_connection_inactivities
+                    );
+                to_remove.insert(peer_a_guard.recipient.addr);
+                to_remove.insert(peer_b_guard.recipient.addr);
+            };
+        }
+
+        for k in to_remove {
+            self.pairing.remove(&k).expect("unable to remvoe key");
+        }
+    }
+
+    fn remove_expired_pairing_request(&mut self, args: &Args) {
+        self.pending_pairing.retain(|_, (v, pending_timer)| {
+            if pending_timer.is_expired(args.timeout_pairing) {
+                println_if_verbose!(
+                    args.verbose,
+                    "> Pending pairing from '{v}' is expired after {} seconds",
+                    args.timeout_pairing
+                );
+                return false;
+            }
+            true
+        });
+    }
+}
+
+fn start_relay_service(args: &Args, socket: UdpSocket) {
+    let mut registry = RelayService {
+        pairing: HashMap::new(),
+        pending_pairing: HashMap::new(),
+        socket: &socket,
+    };
+
+    // loop untils some value is returned by the functor
+    let mut buf = [0u8; 65535];
+    let mut no_connection_since: Option<ExpiringTimer> = None;
+
+    // let psk_bytes = args.preshared_key.as_bytes();
+    loop {
+        match registry.socket.recv_from(&mut buf) {
+            Ok((n, from)) if n > 0 => match registry.pairing.get(&from) {
+                Some(sender) => process_relay_service(&args, &buf[..n], &sender),
+                None => process_pairing_request(&args, &mut registry, &buf[..n], &from),
+            },
+
+            // when this socket timeout, do some processing in the following.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+            Err(e) => println!("Unexpected error: {e}"),
+            _ => (),
         };
 
-        let mut handles = Vec::new();
+        // stop this process when it has no activities after the given time
+        match (&no_connection_since, registry.is_empty()) {
+            (Some(timer), true) => {
+                if timer.is_expired(args.timeout_no_connections) {
+                    println_if_verbose!(
+                        args.verbose,
+                        "> No connections for {} seconds. Quitting...",
+                        args.timeout_no_connections
+                    );
+                    break;
+                }
+            }
+            // remove timer as there's pending connections
+            (Some(_), false) => no_connection_since = None,
+            // add a pending timer
+            (None, true) => no_connection_since = Some(ExpiringTimer::new()),
+            (None, false) => (), // all is good
+        };
 
-        let args = &args;
-        for _ in 1..5 {
-            let peer_a = Arc::new(Peer {
-                socket: &udp_a,
-                addr: Mutex::new(peers.0),
-            });
-            let peer_b = Arc::new(Peer {
-                socket: &udp_b,
-                addr: Mutex::new(peers.1),
-            });
-            let peer_a_clone = peer_a.clone();
-            let peer_b_clone = peer_b.clone();
-            handles.push(scope.spawn(move || relay_worker(&peer_a_clone, &peer_b_clone, args)));
-            handles.push(scope.spawn(move || relay_worker(&peer_b, &peer_a, args)));
+        registry.remove_expired_pairing_request(&args);
+        registry.remove_inactive_connections(&args);
+    }
+    println!("end");
+}
+
+
+
+fn post_fork_parent(ppid: i32, cpid: i32) -> ! {
+    println!("Daeminized process started; pid: {}.", cpid);
+    exit(0)
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+
+    // Create UDP sockets for listening port
+    let socket = match bind_socket(args.bind_ip, args.udp_port, &args) {
+        Ok(socket) => socket,
+        Err(e) => {
+            println!("Cannot binds socket: {}", e);
+            exit(49)
         }
+    };
 
-        while handles.len() > 0 {
-            // join_thread_handle(handles.remove(0));
+    if args.daemonize {
+        // let stdout = File::create("/tmp/daemon.out").unwrap();
+        // let stderr = File::create("/tmp/daemon.err").unwrap();
 
-            if let Err(e) = handles.remove(0).join().unwrap() {
-                println_if_verbose!(args.verbose, "{}: ", e.to_message());
+        let daemon = Daemon::new()
+            .pid_file("/tmp/udprelay-rs.pid", Some(false))
+            .umask(0o000)
+            .work_dir("/tmp")
+            // .stdout(stdout)
+            // .stderr(stderr)
+            // Hooks are optional
+            .setup_post_fork_parent_hook(post_fork_parent);
+
+        match daemon.start() {
+            Ok(_) => println!("Success, daemonized"),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return ExitCode::from(128);
             }
         }
-        // {
-        //     let peer_a = Arc::new(Peer {
-        //         socket: &udp_a,
-        //         addr: Mutex::new(peers.0),
-        //     });
-        //     let peer_b = Arc::new(Peer {
-        //         socket: &udp_b,
-        //         addr: Mutex::new(peers.1),
-        //     });
-        //     let peer_a_clone = peer_a.clone();
-        //     let peer_b_clone = peer_b.clone();
-        //     scope.spawn(move || relay_worker(&peer_a_clone, &peer_b_clone, args));
-        //     scope.spawn(move || relay_worker(&peer_b, &peer_a, args));
-        // }
-        // {
-        //     let peer_a = Arc::new(Peer {
-        //         socket: &udp_a,
-        //         addr: Mutex::new(peers.0),
-        //     });
-        //     let peer_b = Arc::new(Peer {
-        //         socket: &udp_b,
-        //         addr: Mutex::new(peers.1),
-        //     });
-        //     let peer_a_clone = peer_a.clone();
-        //     let peer_b_clone = peer_b.clone();
-        //     scope.spawn(move || relay_worker(&peer_a_clone, &peer_b_clone, args));
-        //     scope.spawn(move || relay_worker(&peer_b, &peer_a, args));
-        // }
+    }
+    start_relay_service(&args, socket);
 
-        // let peer_a_clone = peer_a.clone();
-        // let peer_b_clone = peer_b.clone();
-        // scope.spawn(move || relay_worker(&udp_a, &udp_b, peer_a_clone, peer_b_clone, &args));
-        // let peer_a_clone = peer_a.clone();
-        // let peer_b_clone = peer_b.clone();
-        // scope.spawn(move || relay_worker(&udp_a, &udp_b, peer_a_clone, peer_b_clone, &args));
-    });
-    println!("end");
+    ExitCode::SUCCESS
 }
