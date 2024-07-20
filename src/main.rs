@@ -12,21 +12,10 @@ use std::time::SystemTime;
 use clap::Parser;
 use daemonize_me::Daemon;
 
-enum Ops {
-    // SYN,
-    ACK,
-    EstablishConnection,
-}
-
-impl Ops {
-    fn value(&self) -> [u8; 2] {
-        match *self {
-            // Ops::SYN => [0xff, 0x02],
-            Ops::ACK => [0xff, 0x12],
-            Ops::EstablishConnection => [0xff, 0x05],
-        }
-    }
-}
+const OPS_ACK: [u8; 2] = [0xff, 0x12];
+const OPS_PING: [u8; 2] = [0xff, 0x15];
+const OPS_PONG: [u8; 2] = [0xff, 0x16];
+const OPS_CONN_REQ: [u8; 2] = [0xff, 0x05];
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -210,6 +199,29 @@ fn process_relay_service(args: &Args, buffer: &[u8], sender: &Rc<RefCell<Recipie
     );
 }
 
+fn process_maybe_request(
+    args: &Args,
+    registry: &mut RelayService,
+    buffer: &[u8],
+    from: &SocketAddr,
+) {
+    if buffer.len() < 2 {
+        return;
+    }
+    if let Ok(token) = TryInto::<&[u8; 2]>::try_into(&buffer[0..2]) {
+        match token {
+            &OPS_PING => {
+                registry
+                    .socket
+                    .send_to(&OPS_PONG, from)
+                    .expect("Error in sending message");
+            }
+            &OPS_CONN_REQ => process_pairing_request(&args, registry, &buffer, &from),
+            _ => (),
+        }
+    }
+}
+
 fn process_pairing_request(
     args: &Args,
     registry: &mut RelayService,
@@ -225,73 +237,67 @@ fn process_pairing_request(
     // S: Secret key (where len = y)
     if buffer.len() > (2 + args.preshared_key.as_bytes().len()) {
         // check at least it has the minimum number of bytes needed
-        if buffer[0..2] == Ops::EstablishConnection.value() {
-            println_if_verbose!(args.verbose, "> Got establish connection token from {from}");
+        println_if_verbose!(args.verbose, "> Got establish connection token from {from}");
 
-            let n_psk: usize = buffer[2].into();
-            let psk_end = 4 + n_psk;
-            let n_secret: usize = buffer[3].into();
-            if buffer.len() < n_psk + n_secret {
-                println_if_verbose!(
-                    args.verbose,
-                    "> Aborting as there aren't enough message length than needed"
-                );
-                return;
-            }
+        let n_psk: usize = buffer[2].into();
+        let psk_end = 4 + n_psk;
+        let n_secret: usize = buffer[3].into();
+        if buffer.len() < n_psk + n_secret {
+            println_if_verbose!(
+                args.verbose,
+                "> Aborting as there aren't enough message length than needed"
+            );
+            return;
+        }
 
-            let peer_secret = &buffer[psk_end..(psk_end + n_secret)];
+        let peer_secret = &buffer[psk_end..(psk_end + n_secret)];
 
-            if &buffer[4..psk_end] == psk_bytes {
-                // send ack
-                println_if_verbose!(
-                    args.verbose,
-                    "> Authenticated. Peer secret: {:?}",
-                    str::from_utf8(peer_secret).unwrap_or("[some bytes]")
-                );
-                match registry.pending_pairing.get_mut(peer_secret) {
-                    Some((other_peer, timer)) if other_peer == from => {
-                        println_if_verbose!(
-                            args.verbose,
-                            "> Found existing pairing request from same address/ip/secret. Ignoring..."
-                        );
-                        timer.access();
-                    }
-                    Some((_, _)) => {
-                        let (other_peer, _) = registry
-                            .pending_pairing
-                            .remove(peer_secret)
-                            .expect("This should exists, as it just were");
-                        let (peer1, peer2) = build_paired_peers(
-                            &other_peer,
-                            &registry.socket,
-                            from,
-                            &registry.socket,
-                        );
-                        println_if_verbose!(
-                            args.verbose,
-                            "> Found other peer with same secret. Connecting {} to {}.",
-                            peer1.borrow().recipient.addr,
-                            peer2.borrow().recipient.addr,
-                        );
-                        registry.pairing.insert(other_peer, peer1);
-                        registry.pairing.insert(from.clone(), peer2);
-                    }
-                    None => {
-                        let message = concat_arrays(&Ops::ACK.value(), peer_secret);
-                        registry
-                            .socket
-                            .send_to(&message, from)
-                            .expect("Error in sending message");
-
-                        registry
-                            .pending_pairing
-                            .borrow_mut()
-                            .insert(peer_secret.to_owned(), (from.clone(), ExpiringTimer::new()));
-                    }
+        if &buffer[4..psk_end] == psk_bytes {
+            // send ack
+            println_if_verbose!(
+                args.verbose,
+                "> Authenticated. Peer secret: {:?}",
+                str::from_utf8(peer_secret).unwrap_or("[some bytes]")
+            );
+            match registry.pending_pairing.get_mut(peer_secret) {
+                Some((other_peer, timer)) if other_peer == from => {
+                    println_if_verbose!(
+                        args.verbose,
+                        "> Found existing pairing request from same address/ip/secret. Ignoring..."
+                    );
+                    timer.access();
                 }
-            } else {
-                println_if_verbose!(args.verbose, "> Aborting as psk does not match");
+                Some((_, _)) => {
+                    let (other_peer, _) = registry
+                        .pending_pairing
+                        .remove(peer_secret)
+                        .expect("This should exists, as it just were");
+                    let (peer1, peer2) =
+                        build_paired_peers(&other_peer, &registry.socket, from, &registry.socket);
+                    println_if_verbose!(
+                        args.verbose,
+                        "> Found other peer with same secret. Connecting {} to {}.",
+                        peer1.borrow().recipient.addr,
+                        peer2.borrow().recipient.addr,
+                    );
+                    registry.pairing.insert(other_peer, peer1);
+                    registry.pairing.insert(from.clone(), peer2);
+                }
+                None => {
+                    let message = concat_arrays(&OPS_ACK, peer_secret);
+                    registry
+                        .socket
+                        .send_to(&message, from)
+                        .expect("Error in sending message");
+
+                    registry
+                        .pending_pairing
+                        .borrow_mut()
+                        .insert(peer_secret.to_owned(), (from.clone(), ExpiringTimer::new()));
+                }
             }
+        } else {
+            println_if_verbose!(args.verbose, "> Aborting as psk does not match");
         }
     }
 }
@@ -370,7 +376,7 @@ fn start_relay_service(args: &Args, socket: UdpSocket) {
         match registry.socket.recv_from(&mut buf) {
             Ok((n, from)) if n > 0 => match registry.pairing.get(&from) {
                 Some(sender) => process_relay_service(&args, &buf[..n], &sender),
-                None => process_pairing_request(&args, &mut registry, &buf[..n], &from),
+                None => process_maybe_request(&args, &mut registry, &buf[..n], &from),
             },
 
             // when this socket timeout, do some processing in the following.
