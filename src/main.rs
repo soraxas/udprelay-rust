@@ -89,7 +89,7 @@ impl ExpiringTimer {
     }
 
     fn new() -> ExpiringTimer {
-        return ExpiringTimer(SystemTime::now());
+        ExpiringTimer(SystemTime::now())
     }
 }
 
@@ -102,7 +102,7 @@ struct Recipient<'a> {
 impl Recipient<'_> {
     fn send_message(&self, message: &[u8]) {
         self.socket
-            .send_to(&message, self.addr)
+            .send_to(message, self.addr)
             .expect("Error in sending message");
     }
 }
@@ -135,16 +135,16 @@ fn build_paired_peers<'a>(
 ) {
     let peer1 = Rc::new(RefCell::new(RecipientData {
         recipient: Recipient {
-            socket: &udp_1,
-            addr: addr_1.clone(),
+            socket: udp_1,
+            addr: *addr_1,
         },
         last_accessed: ExpiringTimer::new(),
         opponent: None,
     }));
     let peer2 = Rc::new(RefCell::new(RecipientData {
         recipient: Recipient {
-            socket: &udp_2,
-            addr: addr_2.clone(),
+            socket: udp_2,
+            addr: *addr_2,
         },
         last_accessed: ExpiringTimer::new(),
         opponent: None,
@@ -167,11 +167,11 @@ fn build_paired_peers<'a>(
 }
 
 fn bind_socket(ip: Ipv4Addr, port: u16, args: &Args) -> Result<UdpSocket, io::Error> {
-    UdpSocket::bind((ip, port)).and_then(|socket| {
+    UdpSocket::bind((ip, port)).map(|socket| {
         socket
             .set_read_timeout(Some(Duration::new(args.timeout_socket_wait, 0)))
             .ok();
-        Ok(socket)
+        socket
     })
 }
 
@@ -189,12 +189,12 @@ fn process_relay_service(args: &Args, buffer: &[u8], sender: &Rc<RefCell<Recipie
     sender.last_accessed.access();
     let receiver = sender.get_opponent();
     let receiver = receiver.as_ref().borrow_mut();
-    receiver.recipient.send_message(&buffer);
+    receiver.recipient.send_message(buffer);
     println_if_verbose!(
         args.verbose,
         "> Relaying message {} => {} => {}: ",
         sender.recipient.addr,
-        str::from_utf8(&buffer).unwrap_or("[some bytes]").trim(),
+        str::from_utf8(buffer).unwrap_or("[some bytes]").trim(),
         receiver.recipient.addr
     );
 }
@@ -209,14 +209,14 @@ fn process_maybe_request(
         return;
     }
     if let Ok(token) = TryInto::<&[u8; 2]>::try_into(&buffer[0..2]) {
-        match token {
-            &OPS_PING => {
+        match *token {
+            OPS_PING => {
                 registry
                     .socket
                     .send_to(&OPS_PONG, from)
                     .expect("Error in sending message");
             }
-            &OPS_CONN_REQ => process_pairing_request(&args, registry, &buffer, &from),
+            OPS_CONN_REQ => process_pairing_request(args, registry, buffer, from),
             _ => (),
         }
     }
@@ -273,7 +273,7 @@ fn process_pairing_request(
                         .remove(peer_secret)
                         .expect("This should exists, as it just were");
                     let (peer1, peer2) =
-                        build_paired_peers(&other_peer, &registry.socket, from, &registry.socket);
+                        build_paired_peers(&other_peer, registry.socket, from, registry.socket);
                     println_if_verbose!(
                         args.verbose,
                         "> Found other peer with same secret. Connecting {} to {}.",
@@ -281,7 +281,7 @@ fn process_pairing_request(
                         peer2.borrow().recipient.addr,
                     );
                     registry.pairing.insert(other_peer, peer1);
-                    registry.pairing.insert(from.clone(), peer2);
+                    registry.pairing.insert(*from, peer2);
                 }
                 None => {
                     let message = concat_arrays(&OPS_ACK, peer_secret);
@@ -293,7 +293,7 @@ fn process_pairing_request(
                     registry
                         .pending_pairing
                         .borrow_mut()
-                        .insert(peer_secret.to_owned(), (from.clone(), ExpiringTimer::new()));
+                        .insert(peer_secret.to_owned(), (*from, ExpiringTimer::new()));
                 }
             }
         } else {
@@ -314,12 +314,12 @@ impl RelayService<'_> {
     }
 
     fn remove_inactive_connections(&mut self, args: &Args) {
-        if self.pairing.len() == 0 {
+        if self.pairing.is_empty() {
             return;
         }
         // keep track of the pairs of addr to remove.
         let mut to_remove = HashSet::new();
-        for (_, peer_a_rc) in &self.pairing {
+        for peer_a_rc in self.pairing.values() {
             let mut peer_a_guard = peer_a_rc.as_ref().borrow_mut();
             let peer_b_rc = peer_a_guard.get_opponent();
             let peer_b_guard = peer_b_rc.as_ref().borrow_mut();
@@ -375,8 +375,8 @@ fn start_relay_service(args: &Args, socket: UdpSocket) {
     loop {
         match registry.socket.recv_from(&mut buf) {
             Ok((n, from)) if n > 0 => match registry.pairing.get(&from) {
-                Some(sender) => process_relay_service(&args, &buf[..n], &sender),
-                None => process_maybe_request(&args, &mut registry, &buf[..n], &from),
+                Some(sender) => process_relay_service(args, &buf[..n], sender),
+                None => process_maybe_request(args, &mut registry, &buf[..n], &from),
             },
 
             // when this socket timeout, do some processing in the following.
@@ -404,8 +404,8 @@ fn start_relay_service(args: &Args, socket: UdpSocket) {
             (None, false) => (), // all is good
         };
 
-        registry.remove_expired_pairing_request(&args);
-        registry.remove_inactive_connections(&args);
+        registry.remove_expired_pairing_request(args);
+        registry.remove_inactive_connections(args);
     }
 }
 
