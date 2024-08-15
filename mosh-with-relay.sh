@@ -67,7 +67,7 @@ if [ "$#" != 0 ]; then
         shift
         ;;
       -v|--verbose)
-        VERBOSE="set -x"
+        VERBOSE="true"
         ;;
       --*=*)  # convert '--name=arg' to '--name' 'arg'
         set -- "${opt%%=*}" "${opt#*=}" "$@";;
@@ -88,82 +88,16 @@ if [ "$#" != 0 ]; then
   shift # remove the EOL token
 fi
 
-if [ "$#" -ne 1 ]; then
-    help
-    exit 1
-fi
-TARGET_SSH_SERVER="$1"
-
-on_exit() {
-    status=$?
-    rm -f "$TMP_SSH_CONFIG"
-    # shellcheck disable=SC2181
-    [ "$status" -eq 0 ] && exit
-    # non-zero exit status
-    error_echo "> Error occured. Reason:"
-    [ -z "$MODE" ] && MODE=Destination
-    case "$status" in
-        40) error_echo "- [$MODE] Unknown nc type"
-        ;;
-        41) error_echo "- [$MODE] nc / socat is not installed"
-        ;;
-        42) error_echo "- [$MODE] Failed to send PSK to relay server"
-        ;;
-        43) error_echo "- [$MODE] MOSH_SERVER_KEY seems to be empty"
-        ;;
-        44) error_echo "- [$MODE] CLIENT_PORT is in-use"
-        ;;
-        45) error_echo "- [$MODE] Failed to send message. Connection refused? Relay server not reachable?"
-        ;;
-        46) error_echo "- [$MODE] Unknown error message in when starting mosh-server"
-        ;;
-        47) error_echo "- [$MODE] Unable to start any new mosh-server from given port range [$SPORT_RANGE_START-$SPORT_RANGE_END]"
-        ;;
-        49) error_echo "- [$MODE] relay-server had already been started."
-        ;;
-        127) error_echo "- [$MODE] Command not found?"
-        ;;
-        134) error_echo "- [$MODE] likely to be nc failing (core dump?) due to binded port"
-        ;;
-        *) error_echo "- [$MODE] Unknown. Not an exit code that we had set: $status."
-        ;;
-    esac
-    exit "$status"
-}
-trap on_exit EXIT
-
-$VERBOSE
-
-SSH_ARGS=()
-if command -v assh >/dev/null 2>&1; then
-    TMP_SSH_CONFIG="$(mktemp)"
-    assh config build | sed 's/# HostName:/HostName/' >"$TMP_SSH_CONFIG"
-    SSH_ARGS+=(-F "$TMP_SSH_CONFIG")
-fi
-
-retrieve_hostname_from_ssh_config() {
-    # convert from ssh alias to homename
-    # if assh exists, get hostname from it
-    ssh "${SSH_ARGS[@]}" -G "$1" | awk '$1 == "hostname" { print $2 }'
-}
-
-RELAY_SERVER_HOSTNAME="$(retrieve_hostname_from_ssh_config $RELAY_SERVER_SSH_NAME)"
-
-
-if [ -z "$RELAY_SERVER_SSH_NAME" ]; then
-    # directly use mosh to connects
-    exec mosh --ssh="ssh $(echo "${SSH_ARGS[@]}")" "$TARGET_SSH_SERVER"
-fi
-
-
-# EstablishConnection=(255 5)
-
 # we will store some helper functions here, as we want to
 # pass them via ssh tunneel, and yet we don't want to re-defining
 # them twice (once in souce and once in variables)
 read -r -d '' HELPERS_DEF <<'EOF'
 set -e
 set -o pipefail
+
+verbose_echo() {
+    [ -n "$VERBOSE" ] && >&2 printf "[VERBOSE] %s\n" "$@" || true
+}
 
 has_cmd() {
     command -v "$1" >/dev/null
@@ -226,8 +160,85 @@ get_establish_message() {
     printf '%s' "$PSK" "$session_secret"
 }
 EOF
+
 # source the defined helper functions
 . <(echo "$HELPERS_DEF")
+
+if [ "$#" -ne 1 ]; then
+    help
+    exit 1
+fi
+TARGET_SSH_SERVER="$1"
+
+on_exit() {
+    status=$?
+    rm -f "$TMP_SSH_CONFIG"
+    # shellcheck disable=SC2181
+    [ "$status" -eq 0 ] && exit
+    # non-zero exit status
+    error_echo "> Error occured. Reason:"
+    [ -z "$MODE" ] && MODE=Destination
+    case "$status" in
+        40) error_echo "- [$MODE] Unknown nc type"
+        ;;
+        41) error_echo "- [$MODE] nc / socat is not installed"
+        ;;
+        42) error_echo "- [$MODE] Failed to send PSK to relay server"
+        ;;
+        43) error_echo "- [$MODE] MOSH_SERVER_KEY seems to be empty"
+        ;;
+        44) error_echo "- [$MODE] CLIENT_PORT is in-use"
+        ;;
+        45) error_echo "- [$MODE] Failed to send message. Connection refused? Relay server not reachable?"
+        ;;
+        46) error_echo "- [$MODE] Unknown error message in when starting mosh-server"
+        ;;
+        47) error_echo "- [$MODE] Unable to start any new mosh-server from given port range [$SPORT_RANGE_START-$SPORT_RANGE_END]"
+        ;;
+        49) error_echo "- [$MODE] relay-server had already been started."
+        ;;
+        50) error_echo "- [$MODE] SSH command to target server failed. (unable to directly connect via ssh?)"
+        ;;
+        127) error_echo "- [$MODE] Command not found?"
+        ;;
+        134) error_echo "- [$MODE] likely to be nc failing (core dump?) due to binded port"
+        ;;
+        *) error_echo "- [$MODE] Unknown. Not an exit code that we had set: $status."
+        ;;
+    esac
+    exit "$status"
+}
+trap on_exit EXIT
+
+
+SSH_ARGS=()
+if command -v assh >/dev/null 2>&1; then
+    verbose_echo "Using assh to build ssh config"
+    TMP_SSH_CONFIG="$(mktemp)"
+    assh config build | sed 's/# HostName:/HostName/' >"$TMP_SSH_CONFIG"
+    SSH_ARGS+=(-F "$TMP_SSH_CONFIG")
+fi
+
+retrieve_hostname_from_ssh_config() {
+    # convert from ssh alias to homename
+    # if assh exists, get hostname from it
+    ssh "${SSH_ARGS[@]}" -G "$1" | awk '$1 == "hostname" { print $2 }'
+}
+
+verbose_echo "Getting hostname from ssh config"
+RELAY_SERVER_HOSTNAME="$(retrieve_hostname_from_ssh_config $RELAY_SERVER_SSH_NAME)"
+
+
+if [ -z "$RELAY_SERVER_SSH_NAME" ]; then
+    # directly use mosh to connects
+    verbose_echo "connecting directly to target server without udp relay"
+    exec mosh --ssh="ssh $(echo "${SSH_ARGS[@]}")" "$TARGET_SSH_SERVER"
+    exit
+fi
+
+
+# EstablishConnection=(255 5)
+
 
 MODE=Local
 
@@ -237,19 +248,27 @@ SPORT_RANGE_START=55500
 SPORT_RANGE_END=55550
 
 
+verbose_echo "Testing client's free port"
 CLIENT_PORT="$(get_free_port $CPORT_RANGE_START $CPORT_RANGE_END)"
+verbose_echo "Got $CLIENT_PORT"
 session_secret="$(mktemp -u XXXXXXXXXXXXXXXX)"
 
+verbose_echo "Getting server's real IP"
 RELAY_SERVER_IP="$(getent hosts "$RELAY_SERVER_HOSTNAME" | awk '{ print $1 }' | head -n1)"
+verbose_echo "Got $RELAY_SERVER_IP"
 # RELAY_SERVER_IP=127.0.0.1
 
 # start relay server
 # ssh "$RELAY_SERVER_HOSTNAME" 'bash -s'<<EOF
+verbose_echo "Testing if udp daemon is running on relay server $RELAY_SERVER_HOSTNAME"
 if [ "$(printf $OPS_PONG)" != "$(printf $OPS_PING | socat -t 0.6 - UDP4:$RELAY_SERVER_IP:$RELAY_PORT 2>/dev/null)" ]; then
+    verbose_echo "Nope. Starting udp daemon on relay server $RELAY_SERVER_HOSTNAME"
     # server is not up
     ssh "$RELAY_SERVER_SSH_NAME" 'bash -s'<<EOF
     "$relay_server_udprelay_binary" "$RELAY_PORT" -d
 EOF
+else
+    verbose_echo "Replay server is up."
 fi
 
 
@@ -258,27 +277,37 @@ MODE=SSH
 # the following forward a copy of all the helpers, then search for a free udp-port,
 # sends a udp package to the relay-server from the to-be server port (hole punching),
 # then finally starting the mosh server.
-SERVER_RESPONSE="$(ssh "$TARGET_SSH_SERVER" 'bash -s'<<EOF
-$VERBOSE
+verbose_echo "Getting mosh-server key from target server with actual ssh"
+SERVER_RESPONSE="$(ssh "$TARGET_SSH_SERVER" 'bash -s'<<EOF || exit 50
+export VERBOSE="$VERBOSE"
 $HELPERS_DEF
+verbose_echo "(server) Getting free port"
 SERVER_PORT="\$(get_free_port $SPORT_RANGE_START $SPORT_RANGE_END)"
+verbose_echo "(server) Got \$SERVER_PORT. Sending handshake to relay server now."
 send_psk "$RELAY_PSK" "$session_secret" "$RELAY_SERVER_IP" "$RELAY_PORT" "\$SERVER_PORT" >/dev/null
+verbose_echo "(server) Handshake done. Starting mosh-server now."
 mosh-server new  -p "\$SERVER_PORT"  # 2>/dev/null
+verbose_echo "(server) Successfully started mosh-server"
 EOF
 )"
 MOSH_SERVER_KEY="$(echo "$SERVER_RESPONSE" | sed -n 's/^.*MOSH CONNECT [0-9]\+ \(.*\)$/\1/ p')"
 
 
 MODE=Local
-[ -n "$MOSH_SERVER_KEY" ] || exit 43
+if [ -z "$MOSH_SERVER_KEY" ]; then
+  verbose_echo "Failed to get mosh-server key from target server (it's empty)."
+  exit 43
+fi
 
 ###############################
 # connects to relay-server
 # handshake to establish binding ports
+verbose_echo "Sending handshake to relay server"
 send_psk "$RELAY_PSK" "$session_secret" "$RELAY_SERVER_IP" "$RELAY_PORT" "$CLIENT_PORT"
 
 # launch the actual mosh client
 export MOSH_KEY="$MOSH_SERVER_KEY"
 export MOSH_CLIENT_PORT="$CLIENT_PORT"
 
+verbose_echo "Executing final mosh-client now"
 exec "$mosh_client_binary" "$RELAY_SERVER_IP" "$RELAY_PORT"
