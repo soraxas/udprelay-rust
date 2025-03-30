@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 error_echo() {
     >&2 printf "\033[1;31m%s\033[0m\n" "$@"
@@ -96,7 +96,7 @@ set -e
 set -o pipefail
 
 verbose_echo() {
-    [ -n "$VERBOSE" ] && >&2 printf "[VERBOSE] %s\n" "$@" || true
+    [ -n "$VERBOSE" ] && >&2 printf "[VERBOSE] [$MODE] %s\n" "$@" || true
 }
 
 has_cmd() {
@@ -117,10 +117,14 @@ universial_nc() {
     source_port="$3"
     [ -z "$source_port" ] && source_port="$2"
     if has_cmd socat; then
+        verbose_echo "[nc] using socat"
         socat - "UDP4:$1:$target_port,sourceport=$source_port"
         # socat STDIN "UDP-SENDTO:$1:$target_port,sourceport=$source_port"
     elif has_cmd nc; then
+        set +e
         _detect_nc_type; _type="$?"
+        set -e
+        verbose_echo "[nc] using nc type $_type"
         if [ "$_type" -eq 0 ]; then
             nc -cu "$1" -p "$source_port" "$target_port"
             # the previous command might returns non zero status
@@ -129,6 +133,7 @@ universial_nc() {
             nc -u -q0 "$1" "$target_port"
         fi
     else
+        verbose_echo "[nc] no suitable command found"
         exit 41
     fi
 }
@@ -258,6 +263,23 @@ RELAY_SERVER_IP="$(getent hosts "$RELAY_SERVER_HOSTNAME" | awk '{ print $1 }' | 
 verbose_echo "Got $RELAY_SERVER_IP"
 # RELAY_SERVER_IP=127.0.0.1
 
+
+CLIENT_IP="$(curl https://ipinfo.io/ip)"
+verbose_echo "Got $CLIENT_IP for client IP"
+
+export MODE=Relay
+SERVER_RESPONSE="$(ssh "$RELAY_SERVER_SSH_NAME" 'bash -s'<<EOF || exit $?
+export VERBOSE="$VERBOSE"
+export MODE=Relay
+export PATH="/usr/local/bin:\$PATH"
+$HELPERS_DEF
+verbose_echo "Sending udp packet to client to establish hole-punching."
+set -x
+universial_nc "$CLIENT_IP" "$CLIENT_PORT" "$RELAY_PORT"
+verbose_echo "Successfully sent packet"
+EOF
+)"
+
 # start relay server
 # ssh "$RELAY_SERVER_HOSTNAME" 'bash -s'<<EOF
 verbose_echo "Testing if udp daemon is running on relay server $RELAY_SERVER_HOSTNAME"
@@ -270,16 +292,18 @@ EOF
 else
     verbose_echo "Replay server is up."
 fi
+# send_psk "$RELAY_PSK" "$session_secret" "$RELAY_SERVER_IP" "$RELAY_PORT" "$CLIENT_PORT"
 
 
-MODE=SSH
+export MODE=Server
 # connects to destination-server
 # the following forward a copy of all the helpers, then search for a free udp-port,
 # sends a udp package to the relay-server from the to-be server port (hole punching),
 # then finally starting the mosh server.
 verbose_echo "Getting mosh-server key from target server with actual ssh"
-SERVER_RESPONSE="$(ssh "$TARGET_SSH_SERVER" 'bash -s'<<EOF || exit 50
+SERVER_RESPONSE="$(ssh "$TARGET_SSH_SERVER" 'bash -s'<<EOF || exit $?
 export VERBOSE="$VERBOSE"
+export MODE=Server
 $HELPERS_DEF
 verbose_echo "(server) Getting free port"
 SERVER_PORT="\$(get_free_port $SPORT_RANGE_START $SPORT_RANGE_END)"
